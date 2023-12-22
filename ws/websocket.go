@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,10 +34,19 @@ const (
 	defaultPingPeriod = (defaultPongWait * 9) / 10
 	// Time allowed for the initial handshake to complete.
 	defaultHandshakeTimeout = 30 * time.Second
-	// The base delay to be used for automatic reconnection. Will double for every attempt up to maxReconnectionDelay.
-	defaultReconnectBackoff = 5 * time.Second
-	// Default maximum reconnection delay for websockets
-	defaultReconnectMaxBackoff = 2 * time.Minute
+	// When the Charging Station is reconnecting, after a connection loss, it will use this variable for the amount of time
+	// it will double the previous back-off time. When the maximum number of increments is reached, the Charging
+	// Station keeps connecting with the same back-off time.
+	defaultRetryBackOffRepeatTimes = 5
+	// When the Charging Station is reconnecting, after a connection loss, it will use this variable as the maximum value
+	// for the random part of the back-off time. It will add a new random value to every increasing back-off time,
+	// including the first connection attempt (with this maximum), for the amount of times it will double the previous
+	// back-off time. When the maximum number of increments is reached, the Charging Station will keep connecting
+	// with the same back-off time.
+	defaultRetryBackOffRandomRange = 15 // seconds
+	// When the Charging Station is reconnecting, after a connection loss, it will use this variable as the minimum backoff
+	// time, the first time it tries to reconnect.
+	defaultRetryBackOffWaitMinimum = 10 * time.Second
 )
 
 // The internal verbose logger
@@ -76,12 +86,13 @@ func NewServerTimeoutConfig() ServerTimeoutConfig {
 // To set a custom configuration, refer to the client's SetTimeoutConfig method.
 // If no configuration is passed, a default configuration is generated via the NewClientTimeoutConfig function.
 type ClientTimeoutConfig struct {
-	WriteWait           time.Duration
-	HandshakeTimeout    time.Duration
-	PongWait            time.Duration
-	PingPeriod          time.Duration
-	ReconnectBackoff    time.Duration
-	ReconnectMaxBackoff time.Duration
+	WriteWait               time.Duration
+	HandshakeTimeout        time.Duration
+	PongWait                time.Duration
+	PingPeriod              time.Duration
+	RetryBackOffRepeatTimes int
+	RetryBackOffRandomRange int
+	RetryBackOffWaitMinimum time.Duration
 }
 
 // NewClientTimeoutConfig creates a default timeout configuration for a websocket endpoint.
@@ -89,12 +100,13 @@ type ClientTimeoutConfig struct {
 // You may change fields arbitrarily and pass the struct to a SetTimeoutConfig method.
 func NewClientTimeoutConfig() ClientTimeoutConfig {
 	return ClientTimeoutConfig{
-		WriteWait:           defaultWriteWait,
-		HandshakeTimeout:    defaultHandshakeTimeout,
-		PongWait:            defaultPongWait,
-		PingPeriod:          defaultPingPeriod,
-		ReconnectBackoff:    defaultReconnectBackoff,
-		ReconnectMaxBackoff: defaultReconnectMaxBackoff,
+		WriteWait:               defaultWriteWait,
+		HandshakeTimeout:        defaultHandshakeTimeout,
+		PongWait:                defaultPongWait,
+		PingPeriod:              defaultPingPeriod,
+		RetryBackOffRepeatTimes: defaultRetryBackOffRepeatTimes,
+		RetryBackOffRandomRange: defaultRetryBackOffRandomRange,
+		RetryBackOffWaitMinimum: defaultRetryBackOffWaitMinimum,
 	}
 }
 
@@ -364,8 +376,10 @@ func (server *Server) AddHttpHandler(listenPath string, handler func(w http.Resp
 }
 
 func (server *Server) Start(port int, listenPath string) {
-
+	server.connMutex.Lock()
 	server.connections = make(map[string]*WebSocket)
+	server.connMutex.Unlock()
+
 	if server.httpServer == nil {
 		server.httpServer = &http.Server{}
 	}
@@ -428,16 +442,16 @@ func (server *Server) StopConnection(id string, closeError websocket.CloseError)
 }
 
 func (server *Server) stopConnections() {
-	server.connMutex.Lock()
-	defer server.connMutex.Unlock()
+	server.connMutex.RLock()
+	defer server.connMutex.RUnlock()
 	for _, conn := range server.connections {
 		conn.closeC <- websocket.CloseError{Code: websocket.CloseNormalClosure, Text: ""}
 	}
 }
 
 func (server *Server) Write(webSocketId string, data []byte) error {
-	server.connMutex.Lock()
-	defer server.connMutex.Unlock()
+	server.connMutex.RLock()
+	defer server.connMutex.RUnlock()
 	ws, ok := server.connections[webSocketId]
 	if !ok {
 		return fmt.Errorf("couldn't write to websocket. No socket with id %v is open", webSocketId)
@@ -973,7 +987,8 @@ func (client *Client) cleanup() {
 
 func (client *Client) handleReconnection() {
 	log.Info("started automatic reconnection handler")
-	delay := client.timeoutConfig.ReconnectBackoff
+	delay := client.timeoutConfig.RetryBackOffWaitMinimum + time.Duration(rand.Intn(client.timeoutConfig.RetryBackOffRandomRange+1))*time.Second
+	reconnectionAttempts := 1
 	for {
 		// Wait before reconnecting
 		select {
@@ -992,11 +1007,13 @@ func (client *Client) handleReconnection() {
 			return
 		}
 		client.error(fmt.Errorf("reconnection failed: %w", err))
-		// Re-connection failed, double the delay
-		delay *= 2
-		if delay >= client.timeoutConfig.ReconnectMaxBackoff {
-			delay = client.timeoutConfig.ReconnectMaxBackoff
+
+		if reconnectionAttempts < client.timeoutConfig.RetryBackOffRepeatTimes {
+			// Re-connection failed, double the delay
+			delay *= 2
+			delay += time.Duration(rand.Intn(client.timeoutConfig.RetryBackOffRandomRange+1)) * time.Second
 		}
+		reconnectionAttempts += 1
 	}
 }
 
@@ -1067,7 +1084,7 @@ func (client *Client) Start(urlStr string) error {
 	log.Infof("connected to server as %s", id)
 	client.reconnectC = make(chan struct{})
 	client.setConnected(true)
-	//Start reader and write routine
+	// Start reader and write routine
 	go client.writePump()
 	go client.readPump()
 	return nil
@@ -1086,13 +1103,14 @@ func (client *Client) Stop() {
 	}
 	client.mutex.Unlock()
 	// Notify reconnection goroutine to stop (if any)
-	close(client.reconnectC)
+	if client.reconnectC != nil {
+		close(client.reconnectC)
+	}
 	if client.errC != nil {
 		close(client.errC)
 		client.errC = nil
 	}
 	// Wait for connection to actually close
-
 }
 
 func (client *Client) error(err error) {

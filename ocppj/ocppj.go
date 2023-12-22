@@ -157,7 +157,7 @@ type CallError struct {
 	MessageTypeId    MessageType    `json:"messageTypeId" validate:"required,eq=4"`
 	UniqueId         string         `json:"uniqueId" validate:"required,max=36"`
 	ErrorCode        ocpp.ErrorCode `json:"errorCode" validate:"errorCode"`
-	ErrorDescription string         `json:"errorDescription" validate:"required"`
+	ErrorDescription string         `json:"errorDescription" validate:"omitempty"`
 	ErrorDetails     interface{}    `json:"errorDetails" validate:"omitempty"`
 }
 
@@ -175,7 +175,11 @@ func (callError *CallError) MarshalJSON() ([]byte, error) {
 	fields[1] = callError.UniqueId
 	fields[2] = callError.ErrorCode
 	fields[3] = callError.ErrorDescription
-	fields[4] = callError.ErrorDetails
+	if callError.ErrorDetails == nil {
+		fields[4] = struct{}{}
+	} else {
+		fields[4] = callError.ErrorDetails
+	}
 	return ocppMessageToJson(fields)
 }
 
@@ -186,17 +190,33 @@ const (
 	MessageTypeNotSupported       ocpp.ErrorCode = "MessageTypeNotSupported"       // A message with an Message Type Number received that is not supported by this implementation.
 	ProtocolError                 ocpp.ErrorCode = "ProtocolError"                 // Payload for Action is incomplete.
 	SecurityError                 ocpp.ErrorCode = "SecurityError"                 // During the processing of Action a security issue occurred preventing receiver from completing the Action successfully.
-	FormationViolation            ocpp.ErrorCode = "FormationViolation"            // Payload for Action is syntactically incorrect or not conform the PDU structure for Action.
 	PropertyConstraintViolation   ocpp.ErrorCode = "PropertyConstraintViolation"   // Payload is syntactically correct but at least one field contains an invalid value.
 	OccurrenceConstraintViolation ocpp.ErrorCode = "OccurrenceConstraintViolation" // Payload for Action is syntactically correct but at least one of the fields violates occurrence constraints.
 	TypeConstraintViolation       ocpp.ErrorCode = "TypeConstraintViolation"       // Payload for Action is syntactically correct but at least one of the fields violates data type constraints (e.g. “somestring”: 12).
 	GenericError                  ocpp.ErrorCode = "GenericError"                  // Any other error not covered by the previous ones.
+	FormatViolationV2             ocpp.ErrorCode = "FormatViolation"               // Payload for Action is syntactically incorrect. This is only valid for OCPP 2.0.1
+	FormatViolationV16            ocpp.ErrorCode = "FormationViolation"            // Payload for Action is syntactically incorrect or not conform the PDU structure for Action. This is only valid for OCPP 1.6
 )
+
+type dialector interface {
+	Dialect() ocpp.Dialect
+}
+
+func FormatErrorType(d dialector) ocpp.ErrorCode {
+	switch d.Dialect() {
+	case ocpp.V16:
+		return FormatViolationV16
+	case ocpp.V2:
+		return FormatViolationV2
+	default:
+		panic(fmt.Sprintf("invalid dialect: %v", d))
+	}
+}
 
 func IsErrorCodeValid(fl validator.FieldLevel) bool {
 	code := ocpp.ErrorCode(fl.Field().String())
 	switch code {
-	case NotImplemented, NotSupported, InternalError, MessageTypeNotSupported, ProtocolError, SecurityError, FormationViolation, PropertyConstraintViolation, OccurrenceConstraintViolation, TypeConstraintViolation, GenericError:
+	case NotImplemented, NotSupported, InternalError, MessageTypeNotSupported, ProtocolError, SecurityError, FormatViolationV16, FormatViolationV2, PropertyConstraintViolation, OccurrenceConstraintViolation, TypeConstraintViolation, GenericError:
 		return true
 	}
 	return false
@@ -299,7 +319,18 @@ func jsonMarshal(t interface{}) ([]byte, error) {
 // An OCPP-J endpoint is one of the two entities taking part in the communication.
 // The endpoint keeps state for supported OCPP profiles and current pending requests.
 type Endpoint struct {
+	dialect  ocpp.Dialect
 	Profiles []*ocpp.Profile
+}
+
+// Sets endpoint dialect.
+func (endpoint *Endpoint) SetDialect(d ocpp.Dialect) {
+	endpoint.dialect = d
+}
+
+// Gets endpoint dialect.
+func (endpoint *Endpoint) Dialect() ocpp.Dialect {
+	return endpoint.dialect
 }
 
 // Adds support for a new profile on the endpoint.
@@ -369,30 +400,34 @@ func parseRawJsonConfirmation(raw interface{}, confirmationType reflect.Type) (o
 func (endpoint *Endpoint) ParseMessage(arr []interface{}, pendingRequestState ClientState) (Message, error) {
 	// Checking message fields
 	if len(arr) < 3 {
-		return nil, ocpp.NewError(FormationViolation, "Invalid message. Expected array length >= 3", "")
+		return nil, ocpp.NewError(FormatErrorType(endpoint), "Invalid message. Expected array length >= 3", "")
 	}
 	rawTypeId, ok := arr[0].(float64)
 	if !ok {
-		return nil, ocpp.NewError(FormationViolation, fmt.Sprintf("Invalid element %v at 0, expected message type (int)", arr[0]), "")
+		return nil, ocpp.NewError(FormatErrorType(endpoint), fmt.Sprintf("Invalid element %v at 0, expected message type (int)", arr[0]), "")
 	}
 	typeId := MessageType(rawTypeId)
 	uniqueId, ok := arr[1].(string)
 	if !ok {
-		return nil, ocpp.NewError(FormationViolation, fmt.Sprintf("Invalid element %v at 1, expected unique ID (string)", arr[1]), uniqueId)
+		return nil, ocpp.NewError(FormatErrorType(endpoint), fmt.Sprintf("Invalid element %v at 1, expected unique ID (string)", arr[1]), uniqueId)
 	}
 	// Parse message
 	if typeId == CALL {
 		if len(arr) != 4 {
-			return nil, ocpp.NewError(FormationViolation, "Invalid Call message. Expected array length 4", uniqueId)
+			return nil, ocpp.NewError(FormatErrorType(endpoint), "Invalid Call message. Expected array length 4", uniqueId)
 		}
-		action := arr[2].(string)
+		action, ok := arr[2].(string)
+		if !ok {
+			return nil, ocpp.NewError(FormatErrorType(endpoint), fmt.Sprintf("Invalid element %v at 2, expected action (string)", arr[2]), uniqueId)
+		}
+
 		profile, ok := endpoint.GetProfileForFeature(action)
 		if !ok {
 			return nil, ocpp.NewError(NotSupported, fmt.Sprintf("Unsupported feature %v", action), uniqueId)
 		}
 		request, err := profile.ParseRequest(action, arr[3], parseRawJsonRequest)
 		if err != nil {
-			return nil, ocpp.NewError(FormationViolation, err.Error(), uniqueId)
+			return nil, ocpp.NewError(FormatErrorType(endpoint), err.Error(), uniqueId)
 		}
 		call := Call{
 			MessageTypeId: CALL,
@@ -414,7 +449,7 @@ func (endpoint *Endpoint) ParseMessage(arr []interface{}, pendingRequestState Cl
 		profile, _ := endpoint.GetProfileForFeature(request.GetFeatureName())
 		confirmation, err := profile.ParseResponse(request.GetFeatureName(), arr[2], parseRawJsonConfirmation)
 		if err != nil {
-			return nil, ocpp.NewError(FormationViolation, err.Error(), uniqueId)
+			return nil, ocpp.NewError(FormatErrorType(endpoint), err.Error(), uniqueId)
 		}
 		callResult := CallResult{
 			MessageTypeId: CALL_RESULT,
@@ -433,13 +468,16 @@ func (endpoint *Endpoint) ParseMessage(arr []interface{}, pendingRequestState Cl
 			return nil, nil
 		}
 		if len(arr) < 4 {
-			return nil, ocpp.NewError(FormationViolation, "Invalid Call Error message. Expected array length >= 4", uniqueId)
+			return nil, ocpp.NewError(FormatErrorType(endpoint), "Invalid Call Error message. Expected array length >= 4", uniqueId)
 		}
 		var details interface{}
 		if len(arr) > 4 {
 			details = arr[4]
 		}
-		rawErrorCode := arr[2].(string)
+		rawErrorCode, ok := arr[2].(string)
+		if !ok {
+			return nil, ocpp.NewError(FormatErrorType(endpoint), fmt.Sprintf("Invalid element %v at 2, expected rawErrorCode (string)", arr[2]), rawErrorCode)
+		}
 		errorCode := ocpp.ErrorCode(rawErrorCode)
 		errorDescription := ""
 		if v, ok := arr[3].(string); ok {
@@ -496,7 +534,7 @@ func (endpoint *Endpoint) CreateCallResult(confirmation ocpp.Response, uniqueId 
 	action := confirmation.GetFeatureName()
 	profile, _ := endpoint.GetProfileForFeature(action)
 	if profile == nil {
-		return nil, fmt.Errorf("Couldn't create Call Result for unsupported action %v", action)
+		return nil, ocpp.NewError(NotSupported, fmt.Sprintf("couldn't create Call Result for unsupported action %v", action), uniqueId)
 	}
 	callResult := CallResult{
 		MessageTypeId: CALL_RESULT,
